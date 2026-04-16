@@ -142,6 +142,29 @@ impl<'a> KeypairChunks<'a> {
             dest: dest_keypair_chunks,
         }
     }
+
+    /// Split input keypairs into chunks where every chunk's destination VecDeque
+    /// contains the same single keypair, so the entire benchmark targets one
+    /// fixed destination account.
+    fn new_with_single_destination(keypairs: &'a [Keypair], chunk_size: usize) -> Self {
+        // Reserve the very first dest slot of the first chunk as the universal sink.
+        // Sources still rotate through different keypairs so signatures stay unique.
+        assert!(
+            keypairs.len() >= 2 * chunk_size,
+            "need at least 2 * chunk_size keypairs"
+        );
+        let single_dest: &Keypair = &keypairs[chunk_size];
+        let mut source_keypair_chunks: Vec<Vec<&Keypair>> = Vec::new();
+        let mut dest_keypair_chunks: Vec<VecDeque<&Keypair>> = Vec::new();
+        for chunk in keypairs.chunks_exact(2 * chunk_size) {
+            source_keypair_chunks.push(chunk[..chunk_size].iter().collect());
+            dest_keypair_chunks.push(std::iter::repeat(single_dest).take(chunk_size).collect());
+        }
+        KeypairChunks {
+            source: source_keypair_chunks,
+            dest: dest_keypair_chunks,
+        }
+    }
 }
 
 struct TransactionChunkGenerator<'a, 'b, T: ?Sized> {
@@ -154,6 +177,9 @@ struct TransactionChunkGenerator<'a, 'b, T: ?Sized> {
     instruction_padding_config: Option<InstructionPaddingConfig>,
     skip_tx_account_data_size: bool,
     use_txv1: bool,
+    /// When true, never swap source/dest in `advance()`, so the destination
+    /// keypair stays fixed for the entire run.
+    single_destination: bool,
 }
 
 impl<'a, 'b, T> TransactionChunkGenerator<'a, 'b, T>
@@ -168,10 +194,13 @@ where
         compute_unit_price: Option<ComputeUnitPrice>,
         instruction_padding_config: Option<InstructionPaddingConfig>,
         num_conflict_groups: Option<usize>,
+        single_destination: bool,
         skip_tx_account_data_size: bool,
         use_txv1: bool,
     ) -> Self {
-        let account_chunks = if let Some(num_conflict_groups) = num_conflict_groups {
+        let account_chunks = if single_destination {
+            KeypairChunks::new_with_single_destination(gen_keypairs, chunk_size)
+        } else if let Some(num_conflict_groups) = num_conflict_groups {
             KeypairChunks::new_with_conflict_groups(gen_keypairs, chunk_size, num_conflict_groups)
         } else {
             KeypairChunks::new(gen_keypairs, chunk_size)
@@ -189,6 +218,7 @@ where
             instruction_padding_config,
             skip_tx_account_data_size,
             use_txv1,
+            single_destination,
         }
     }
 
@@ -261,8 +291,11 @@ where
         // Move on to next chunk
         self.chunk_index = (self.chunk_index + 1) % self.account_chunks.source.len();
 
-        // Switch directions after transferring for each "chunk"
-        if self.chunk_index == 0 {
+        // Switch directions after transferring for each "chunk".
+        // In single-destination mode the destination must remain fixed, so the
+        // reclaim swap is suppressed; that also means source keypairs are drained
+        // monotonically and runs end when they bottom out.
+        if self.chunk_index == 0 && !self.single_destination {
             self.reclaim_lamports_back_to_source_account =
                 !self.reclaim_lamports_back_to_source_account;
         }
@@ -424,6 +457,7 @@ where
         use_durable_nonce,
         instruction_padding_config,
         num_conflict_groups,
+        single_destination,
         block_data_file,
         transaction_data_file,
         use_txv1,
@@ -431,6 +465,15 @@ where
     } = config;
 
     assert!(gen_keypairs.len() >= 2 * tx_count);
+    let single_dest_pubkey = single_destination.then(|| gen_keypairs[tx_count].pubkey());
+    let single_dest_starting_balance = single_dest_pubkey.as_ref().map(|pubkey| {
+        let bal = client.get_balance(pubkey).unwrap_or(0);
+        info!(
+            "Single-destination mode: every transaction targets {pubkey}, starting balance \
+             {bal} lamports",
+        );
+        bal
+    });
     let chunk_generator = TransactionChunkGenerator::new(
         client.clone(),
         &gen_keypairs,
@@ -439,6 +482,7 @@ where
         compute_unit_price,
         instruction_padding_config,
         num_conflict_groups,
+        single_destination,
         skip_tx_account_data_size,
         use_txv1,
     );
@@ -548,6 +592,20 @@ where
         }
     }
 
+    let bench_elapsed = start.elapsed();
+
+    if let (Some(pubkey), Some(starting)) = (single_dest_pubkey, single_dest_starting_balance) {
+        let ending = client.get_balance(&pubkey).unwrap_or(0);
+        let deposits = ending.saturating_sub(starting);
+        info!(
+            "Single-destination deposit summary: {pubkey} balance {starting} -> {ending} \
+             (delta {deposits} lamports = {deposits} successful 1-lamport deposits over \
+             {:.2}s = {:.2} successful deposits/sec)",
+            bench_elapsed.as_secs_f64(),
+            deposits as f64 / bench_elapsed.as_secs_f64().max(f64::EPSILON),
+        );
+    }
+
     if let Some(nonce_keypairs) = nonce_keypairs {
         withdraw_durable_nonce_accounts(client.clone(), &gen_keypairs, &nonce_keypairs);
     }
@@ -558,7 +616,7 @@ where
     compute_and_report_stats(
         &maxes,
         sample_period,
-        &start.elapsed(),
+        &bench_elapsed,
         total_tx_sent_count.load(Ordering::Relaxed),
     );
 
@@ -1507,5 +1565,29 @@ mod tests {
             chunks.dest[1],
             &[&keypairs[12], &keypairs[13], &keypairs[12], &keypairs[13]]
         );
+    }
+
+    #[test]
+    fn test_bench_tps_key_chunks_new_with_single_destination() {
+        let num_keypairs = 16;
+        let chunk_size = 4;
+        let keypairs = std::iter::repeat_with(Keypair::new)
+            .take(num_keypairs)
+            .collect::<Vec<_>>();
+
+        let chunks = KeypairChunks::new_with_single_destination(&keypairs, chunk_size);
+        // Sources still rotate across chunks.
+        assert_eq!(
+            chunks.source[0],
+            &[&keypairs[0], &keypairs[1], &keypairs[2], &keypairs[3]]
+        );
+        assert_eq!(
+            chunks.source[1],
+            &[&keypairs[8], &keypairs[9], &keypairs[10], &keypairs[11]]
+        );
+        // Every dest slot in every chunk points at the same single keypair.
+        let single = &keypairs[chunk_size];
+        assert_eq!(chunks.dest[0], &[single, single, single, single]);
+        assert_eq!(chunks.dest[1], &[single, single, single, single]);
     }
 }

@@ -67,6 +67,7 @@ pub struct Config {
     pub use_durable_nonce: bool,
     pub instruction_padding_config: Option<InstructionPaddingConfig>,
     pub num_conflict_groups: Option<usize>,
+    pub single_destination: bool,
     pub bind_address: IpAddr,
     pub client_node_id: Option<Keypair>,
     pub commitment_config: CommitmentConfig,
@@ -104,6 +105,7 @@ impl Default for Config {
             use_durable_nonce: false,
             instruction_padding_config: None,
             num_conflict_groups: None,
+            single_destination: false,
             bind_address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             client_node_id: None,
             commitment_config: CommitmentConfig::confirmed(),
@@ -343,6 +345,17 @@ pub fn build_args<'a>(version: &'_ str) -> App<'a, '_> {
                 ),
         )
         .arg(
+            Arg::with_name("single_destination")
+                .long("single-destination")
+                .takes_value(false)
+                .conflicts_with("num_conflict_groups")
+                .help(
+                    "Send every transaction to the same single destination keypair across all \
+                     chunks. Also disables the periodic source/destination swap, so the destination \
+                     account is truly fixed for the entire run.",
+                ),
+        )
+        .arg(
             Arg::with_name("bind_address")
                 .long("bind-address")
                 .value_name("HOST")
@@ -552,6 +565,8 @@ pub fn parse_args(matches: &ArgMatches) -> Result<Config, &'static str> {
             .map_err(|_| "Can't parse num-conflict-groups")?;
         args.num_conflict_groups = Some(parsed_num_conflict_groups);
     }
+
+    args.single_destination = matches.is_present("single_destination");
 
     if let Some(addr) = matches.value_of("bind_address") {
         args.bind_address =

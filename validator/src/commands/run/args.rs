@@ -488,6 +488,12 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Skip the check for PoH speed."),
     )
     .arg(
+        Arg::with_name("no_enforce_ulimit_nofile")
+            .long("no-enforce-ulimit-nofile")
+            .hidden(hidden_unless_forced())
+            .help("Skip enforcement of the open-file-descriptor (nofile) ulimit."),
+    )
+    .arg(
         Arg::with_name("no_os_network_limits_test")
             .hidden(hidden_unless_forced())
             .long("no-os-network-limits-test")

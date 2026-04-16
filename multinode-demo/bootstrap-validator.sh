@@ -141,6 +141,7 @@ args+=(
   --rpc-faucet-address 127.0.0.1:9900
   --no-poh-speed-test
   --no-os-network-limits-test
+  --no-enforce-ulimit-nofile
   --no-wait-for-vote-to-start-leader
   --full-rpc-api
   --allow-private-addr
