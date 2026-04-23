@@ -61,7 +61,11 @@ solana-keypair = { workspace = true }
 solana-ledger = { workspace = true, features = ["dev-context-only-utils", "agave-unstable-api"] }
 solana-loader-v3-interface = { workspace = true }
 solana-measure = { workspace = true }
+bincode = { workspace = true }
+solana-compute-budget-interface = { workspace = true }
+solana-fee-calculator = { workspace = true }
 solana-message = { workspace = true }
+solana-nonce = { workspace = true, features = ["serde"] }
 solana-native-token = { workspace = true }
 solana-program-runtime = { workspace = true, features = ["dev-context-only-utils", "metrics"] }
 solana-pubkey = { workspace = true }
@@ -73,7 +77,9 @@ solana-sbpf = { workspace = true, features = ["debugger", "jit"] }
 solana-sdk-ids = { workspace = true }
 solana-shred-version = { workspace = true }
 solana-signature = { workspace = true }
+solana-signer = { workspace = true }
 solana-stake-interface = { workspace = true }
+solana-system-transaction = { workspace = true }
 solana-storage-bigtable = { workspace = true }
 solana-svm-callback = { workspace = true }
 solana-svm-feature-set = { workspace = true }
