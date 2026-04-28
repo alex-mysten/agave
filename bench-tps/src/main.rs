@@ -6,6 +6,7 @@ use {
         cli::{self, ExternalClientType},
         keypairs::get_keypairs,
         send_batch::{generate_durable_nonce_accounts, generate_keypairs},
+        token_setup::setup_token_accounts,
     },
     solana_client::connection_cache::ConnectionCache,
     solana_commitment_config::CommitmentConfig,
@@ -273,5 +274,24 @@ fn main() {
     } else {
         None
     };
-    do_bench_tps(client, cli_config, keypairs, nonce_keypairs);
+
+    let token_context = if cli_config.use_token {
+        // Token accounts indexed 1:1 with gen_keypairs. The dest sits at
+        // index `tx_count` (matches single_destination's dest pubkey
+        // computation in do_bench_tps and KeypairChunks::new_with_single_destination).
+        assert!(
+            cli_config.single_destination,
+            "--use-token requires --single-destination (CLI parser should have enforced this)"
+        );
+        Some(std::sync::Arc::new(setup_token_accounts(
+            client.clone(),
+            &cli_config.id,
+            &keypairs,
+            *tx_count,
+        )))
+    } else {
+        None
+    };
+
+    do_bench_tps(client, cli_config, keypairs, nonce_keypairs, token_context);
 }

@@ -15,14 +15,28 @@ comparison on a Linux Zen 3 server.
 - **Replay** of the same ledger reaches ~25k TPS on the densest bench
   slots; aggregate is diluted by fixed per-slot overhead (PoH verify,
   bank freeze).
-- **Custom packed-ledger replay** at full block packing (10k–15k
-  deposits/slot) tops out at **~35,000 deposits/sec** for 1-instruction
-  transfers, **~25,000–37,000** for 3-instruction (ComputeBudget +
-  AdvanceNonceAccount + Transfer) depending on hardware. Write-lock-
-  serialized execute is the bottleneck; per-tx execute is ~28–30 μs.
+- **Custom packed-ledger replay** at full block packing tops out at
+  **~50,000 deposits/sec** for 1-instruction transfers (ceiling at
+  27,000 txs/slot, bound by the 40 M per-writable-account-cost limit),
+  and **~42,000 deposits/sec** for 3-instruction nonced transfers
+  (ceiling at 19,000 txs/slot, same limit). Write-lock-serialized
+  execute is the bottleneck.
 - **Cross-hardware on Linux bare metal (AMD Zen 3):** pure-transfer
-  ceiling holds (~35–41k); nonced drops ~30% (~25k), likely cache /
-  memory-subsystem effects on the per-tx nonce-account load.
+  ceiling holds (~35–41k on prior measurement); nonced drops ~30%
+  (~25k), likely cache / memory-subsystem effects on the per-tx
+  nonce-account load. Zen 3 numbers below were captured in an earlier
+  session and have not been re-measured today; treat the absolute
+  values as illustrative, the ratios as still-current.
+
+> **Note on update.** The packed-replay numbers were re-measured on
+> this Mac host (same commit) after observing thermally-throttled
+> behavior in an earlier session — old numbers were ~35k peak and
+> ~37k peak respectively. Today's same-commit re-run on a cooler
+> machine landed at the ~50k / ~42k peaks above and is reproducible
+> across runs. The thermally-throttled prior numbers have been removed
+> below; Zen 3 numbers (captured in that earlier session, not today)
+> are flagged inline. See `TOKEN_BENCH_LOG.md` for the same-session
+> SOL baseline used in the SPL Token comparison.
 
 The large gap between live bench and packed-replay numbers means the
 live bench is bottlenecked far upstream of execute (banking stage,
@@ -37,9 +51,13 @@ gap is a follow-up.
   (Apple Silicon VM). Cross-hardware runs on an `amd-zen3` host:
   Ubuntu 22.04, AMD EPYC 7443P (Zen 3, 24c/48t), 251 GB RAM, bare metal.
 - **Toolchain:** rustc 1.94.1, release build.
-- **Repo:** `mystenmark/agave`, branch `mlogan-single-destination-bench`
-  (HEAD `970d6332cb`, on top of master `2d279e16ba`,
-  agave-validator `4.1.0-alpha.0`).
+- **Repo:** `mystenmark/agave`, branches `mlogan-single-destination-bench`
+  (HEAD `970d6332cb`, original session) and `steka-packed-ledger-replay`
+  (HEAD `250591ae4a`, today's re-measurement; only adds the
+  `--use-token` flag to packed-ledger), both on top of master
+  `2d279e16ba`, agave-validator `4.1.0-alpha.0`. The Run 5 packed-ledger
+  numbers were captured today; live-bench (Runs 1–4) and Zen 3
+  cross-hardware (Run 6) numbers are from the original session.
 
 ### Build-env tweaks (macOS / Xcode 26.3)
 
@@ -214,41 +232,54 @@ was independently checked: dest balance went `1 → 10,001` post-replay
 
 ### Densities measured
 
-| txs/slot | mode | block_cost (CU) | accounts | slot Δt | **TPS** |
-|---:|---|---:|---:|---:|---:|
-| 10,000 | pure transfer | 14.8M | 10,001 | 285 ms | **35,100** |
-| 20,000 | pure transfer | 29.6M | 20,001 | 505 ms | 39,600 |
-| 25,000 | pure transfer | 37.0M | 25,001 | 680 ms | 36,800 |
-| 30,000 | pure transfer | — | — | — | rejected: max accounts/block |
-| 10,000 | nonced (3-ix) | 20.8M | 20,001 | 306 ms | 32,700 |
-| 14,000 | nonced | 29.2M | 28,001 | 381 ms | **36,700** |
-| 15,000 | nonced | 31.3M | 30,001 | 424 ms | 35,400 |
+Re-measured on this commit, same Mac host, in a fresh terminal session
+not under thermal throttling. Per-tx cost from `cost_tracker_stats`:
+1481 CU plain, 2084 CU nonced. Per-writable-account cost limit is 40 M
+post-SIMD-0286 (= block-units 100 M × 40%); this is what binds density,
+not unique-account count.
 
-Pure transfer maxes at ~25k txs/slot (one new account per tx + dest =
-~25k unique accounts, just under the per-block cap). Nonced maxes at
-~15k txs/slot (two new accounts per tx: sender + nonce). The block CU
-limit (48M) is not the binding constraint for either; the
-unique-account-count cap is.
+| txs/slot | mode | block_cost (CU) | per-acct cost | accounts | slot Δt | **TPS** |
+|---:|---|---:|---:|---:|---:|---:|
+| 5,000 | pure transfer | 7.4 M | 7.4 M | 5,001 | 108 ms | **46,729** |
+| 10,000 | pure transfer | 14.8 M | 14.8 M | 10,001 | 207 ms | 48,310 |
+| 14,000 | pure transfer | 20.7 M | 20.7 M | 14,001 | 292 ms | 47,945 |
+| 20,000 | pure transfer | 29.6 M | 29.6 M | 20,001 | 395 ms | **50,633** |
+| 25,000 | pure transfer | 37.0 M | 37.0 M | 25,001 | 512 ms | 48,852 |
+| 27,000 | pure transfer | 39.99 M | 39.99 M | 27,001 | 535 ms | **50,420** |
+| 28,000 | pure transfer | — | — | — | — | rejected: `WouldExceedMaxAccountCostLimit` |
+| 5,000 | nonced (3-ix) | 10.4 M | 10.4 M | 10,001 | 117 ms | 42,735 |
+| 10,000 | nonced | 20.8 M | 20.8 M | 20,001 | 235 ms | 42,553 |
+| 14,000 | nonced | 29.2 M | 29.2 M | 28,001 | 324 ms | 43,210 |
+| 18,000 | nonced | 37.5 M | 37.5 M | 36,001 | 432 ms | 41,667 |
+| 19,000 | nonced | 39.6 M | 39.6 M | 38,001 | 457 ms | **41,576** |
+| 19,200 | nonced | — | — | — | — | rejected: `WouldExceedMaxAccountCostLimit` |
+
+Pure transfer ceiling: **27,000 txs/slot** at 39.99 M of 40 M
+per-account budget. Nonced ceiling: **19,000 txs/slot** at 39.6 M.
+Both bind on the per-writable-account-cost limit (40 M = block_units
+100 M × 40%). The unique-account-count cap was misattributed in the
+pre-update version of this doc; the actual binding constraint is the
+per-account cost cap.
 
 ### Pure transfer vs nonced gap
 
-Only ~7% at the same tx count, not 3× as the instruction count would
-suggest. Most per-tx cost is in sig verify, account loads, write-lock
-acquisition, and state commit — both modes pay these equally. The
-extra ComputeBudget + AdvanceNonceAccount instructions add only a
-few μs each.
+At the same density, nonced runs ~13–18% slower than plain (e.g. 14k:
+47.9k plain vs 43.2k nonced). The extra ComputeBudget +
+AdvanceNonceAccount instructions add per-tx CU and write-lock work but
+not 3× — most per-tx cost is in sig verify, account loads, and state
+commit, which both modes pay equally.
 
 ### Headline number
 
-Across both modes at full pack: **~35,000 deposits/sec**. Per-tx
-execute ~28–30 μs on this hardware. Run 4's partially-packed
-measurement (~30k from ~6k-tx slots) was lower because per-slot fixed
-overhead dragged the TPS down at partial packing.
+Pure transfer: **~50,000 TPS** sustained across 5k–27k densities.
+Nonced: **~42,000 TPS** sustained across 5k–19k. Both effectively
+flat across densities, with peaks at the per-account-cost ceiling.
 
-### PoH-rate sensitivity check
+### PoH-rate sensitivity check (from prior session, still valid)
 
-To confirm `hashes_per_tick=2` doesn't inflate the headline, re-ran
-the 10k-nonced gen at three PoH levels:
+10k-nonced gen at three PoH levels (carried forward from the
+thermally-throttled session — relative wall-times are still
+representative):
 
 | `hashes_per_tick` | wall | user CPU | total CPU |
 |---:|---:|---:|---:|
@@ -258,7 +289,7 @@ the 10k-nonced gen at three PoH levels:
 
 Wall time is essentially identical; only CPU goes up. PoH verification
 runs on parallel threads alongside execute, so it doesn't extend the
-critical path. The ~35k TPS holds under realistic PoH.
+critical path. The headline TPS holds under realistic PoH.
 
 ## Run 6 — Cross-hardware on `amd-zen3` (AMD EPYC 7443P, 48-thread, Linux)
 
@@ -289,30 +320,39 @@ critical path.
 
 ### Packed-ledger replay
 
-| workload | amd-zen3 TPS | Mac VM TPS |
-|---:|---:|---:|
-| 10k pure transfer | 35,700 | 35,100 |
-| 25k pure transfer | **41,000** | 36,800 |
-| 10k nonced (3-ix) | 24,300 | 32,700 |
-| 14k nonced | 25,400 | **36,700** |
+Zen 3 numbers are from the original cross-hardware session (not
+re-measured today). Mac VM numbers were captured in the same
+thermally-throttled session, and on this commit are now ~1.4× higher
+when re-measured (see Run 5). The Zen 3 column is therefore stale in
+absolute terms; the **comparison ratio** between the two hardwares
+should still be approximately right but warrants re-measurement.
 
-**Pure-transfer ceiling holds** on Linux bare metal — essentially
-matches the Mac measurement, marginally higher on the denser 25k
-slot. **Nonced drops ~30%** on Zen 3. Unexpected — Zen 3 single-core
-perf is within ~20% of Apple M-series on public benchmarks, so the
-gap is too large to be pure clock. Likely cache / memory-subsystem:
-the extra nonce-account load + bincode deserialize per tx is more
-expensive on EPYC's per-core-L2 + per-CCX-L3 layout than on Apple's
-UMA with a large shared L2.
+| workload | amd-zen3 TPS (prior session) | Mac VM TPS (prior session, throttled) | Mac VM TPS (today, untrottled) |
+|---:|---:|---:|---:|
+| 10k pure transfer | 35,700 | 35,100 | **48,310** |
+| 25k pure transfer | 41,000 | 36,800 | **48,852** |
+| 27k pure transfer (max) | — | — | **50,420** |
+| 10k nonced (3-ix) | 24,300 | 32,700 | **42,553** |
+| 14k nonced | 25,400 | 36,700 | **43,210** |
+| 19k nonced (max) | — | — | **41,576** |
+
+The earlier conclusion still stands directionally: pure-transfer ceiling
+ports closely to Linux bare metal, while nonced drops on Zen 3 due to
+cache / memory-subsystem cost on the per-tx nonce-account load. But
+quantitatively, the Mac peak is not 36k — it's ~50k for plain and ~42k
+for nonced once the host isn't thermally throttled. Re-measure on
+amd-zen3 to get an apples-to-apples 2026-04 comparison; the numbers
+above shouldn't be used to argue specific Mac-vs-Linux gaps until
+that's done.
 
 Implications:
 
-- The Mac VM number is not a VM or Mac-specific artifact: pure
-  transfer replays at the same rate on Linux bare metal.
+- The original Mac measurement was thermal-throttle-bound; the silicon
+  goes higher than that prior session implied. Any single quoted Mac
+  number should reference the today/untrottled column.
 - For production-shape (nonced) workload, throughput is hardware-
-  sensitive in ways the pure-transfer case isn't. Any single number
-  quoted for "Solana single-address deposit ceiling" should specify
-  both the tx shape and the hardware it was measured on.
+  sensitive in ways the pure-transfer case isn't (per the prior-session
+  Zen 3 measurement). Worth re-validating with a re-run.
 
 ## Flaws and caveats
 
@@ -345,15 +385,17 @@ those conditions (follow-up #3).
 
 ## Summary
 
-| config | Mac VM dps | amd-zen3 dps | notes |
+| config | Mac VM dps (today) | amd-zen3 dps (prior session) | notes |
 |---|---:|---:|---|
 | Live, 60s burst | 1,482 | 1,528 | burst-inflated |
 | Live, 600s sustained (Run 1) | 292 | — | honest sustained rate |
 | Live, aggressive client (Run 4) | 401 | — | denser slots, worse aggregate |
 | Replay, live ledger peak slot (Run 2) | ~25,000 | ~25,000 | per-slot TPS |
 | Replay, skip-verify (Run 3) | ~28,000 | — | removes PoH overhead |
-| Packed, pure transfer (Runs 5/6) | ~35,000 | **~41,000** | peaks at 25k-tx slot |
-| Packed, 3-ix nonced (Runs 5/6) | **~35,000** | ~25,000 | workload + hardware sensitive |
+| Packed, pure transfer ceiling (Run 5) | **~50,000** at 27k/slot | 41,000 at 25k/slot* | *Zen 3 not re-measured |
+| Packed, 3-ix nonced ceiling (Run 5) | **~42,000** at 19k/slot | 25,400 at 14k/slot* | *Zen 3 not re-measured |
+| Packed, plain SPL Token (TOKEN_BENCH_LOG) | ~37,400 at 21,260/slot | — | -23% vs SOL plain peak |
+| Packed, nonced SPL Token (TOKEN_BENCH_LOG) | ~27,600 at 16,100/slot | — | -34% vs SOL nonced peak |
 
 ## Open questions / follow-ups
 
@@ -375,6 +417,15 @@ those conditions (follow-up #3).
    Sapphire Rapids host would give a more representative "modern
    validator" number, particularly for the nonced workload which
    appears memory-subsystem-sensitive.
+8. **Re-run Zen 3 on this commit.** The Run 6 cross-hardware Zen 3
+   numbers were captured under the same thermal/cache state as the
+   original (now-stale) Mac numbers. Re-run on amd-zen3 to settle the
+   actual hardware ratio between Apple Silicon and EPYC for both
+   plain and nonced. The directional finding (nonced is hardware-
+   sensitive, plain is not) should still hold.
+9. **Live SPL Token bench.** Companion to `TOKEN_BENCH_LOG.md` —
+   add `--use-token` to bench-tps to measure the live-vs-replay gap
+   for stablecoin-shape transfers, analogous to what was done for SOL.
 
 ## Reproducing
 

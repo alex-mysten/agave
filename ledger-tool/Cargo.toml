@@ -67,6 +67,9 @@ solana-fee-calculator = { workspace = true }
 solana-message = { workspace = true }
 solana-nonce = { workspace = true, features = ["serde"] }
 solana-native-token = { workspace = true }
+solana-program-binaries = { workspace = true }
+solana-program-option = { workspace = true }
+solana-program-pack = { workspace = true }
 solana-program-runtime = { workspace = true, features = ["dev-context-only-utils", "metrics"] }
 solana-pubkey = { workspace = true }
 solana-rent = { workspace = true }
@@ -93,6 +96,8 @@ solana-unified-scheduler-pool = { workspace = true, features = ["dev-context-onl
 solana-version = { workspace = true }
 solana-vote = { workspace = true }
 solana-vote-program = { workspace = true }
+spl-generic-token = { workspace = true }
+spl-token-interface = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 

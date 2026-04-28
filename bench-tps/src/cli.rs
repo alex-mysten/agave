@@ -68,6 +68,7 @@ pub struct Config {
     pub instruction_padding_config: Option<InstructionPaddingConfig>,
     pub num_conflict_groups: Option<usize>,
     pub single_destination: bool,
+    pub use_token: bool,
     pub bind_address: IpAddr,
     pub client_node_id: Option<Keypair>,
     pub commitment_config: CommitmentConfig,
@@ -106,6 +107,7 @@ impl Default for Config {
             instruction_padding_config: None,
             num_conflict_groups: None,
             single_destination: false,
+            use_token: false,
             bind_address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             client_node_id: None,
             commitment_config: CommitmentConfig::confirmed(),
@@ -356,6 +358,21 @@ pub fn build_args<'a>(version: &'_ str) -> App<'a, '_> {
                 ),
         )
         .arg(
+            Arg::with_name("use_token")
+                .long("use-token")
+                .takes_value(false)
+                .requires("single_destination")
+                .help(
+                    "Switch from native SOL transfers to single-destination SPL Token transfers \
+                     (simulates stablecoin transfer performance). At setup, bench-tps creates a \
+                     fresh mint, one token account per sender (funded with tokens), and a dest \
+                     token account. Each tx becomes ComputeBudget::SetComputeUnitLimit + \
+                     spl_token::Transfer (and AdvanceNonceAccount with --use-durable-nonce). \
+                     Requires --single-destination. End-of-run summary reports dest token \
+                     amount delta instead of lamport delta.",
+                ),
+        )
+        .arg(
             Arg::with_name("bind_address")
                 .long("bind-address")
                 .value_name("HOST")
@@ -567,6 +584,7 @@ pub fn parse_args(matches: &ArgMatches) -> Result<Config, &'static str> {
     }
 
     args.single_destination = matches.is_present("single_destination");
+    args.use_token = matches.is_present("use_token");
 
     if let Some(addr) = matches.value_of("bind_address") {
         args.bind_address =

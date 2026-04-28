@@ -144,7 +144,7 @@ fn run_bench_tps(client: Arc<TpuClient<QuicPool, QuicConnectionManager, QuicConf
         None
     };
 
-    let tps = do_bench_tps(client, config, keypairs, nonce_keypairs);
+    let tps = do_bench_tps(client, config, keypairs, nonce_keypairs, None);
     assert!(tps > 100, "TPS less than expected {tps}");
 }
 

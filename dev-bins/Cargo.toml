@@ -129,6 +129,9 @@ solana-net-utils = { path = "../net-utils", version = "=4.1.0-alpha.0", features
 solana-nonce = "3.2.0"
 solana-precompile-error = "3.0.0"
 solana-program-runtime = { path = "../program-runtime", version = "=4.1.0-alpha.0", features = ["agave-unstable-api"] }
+solana-program-binaries = { path = "../program-binaries", version = "=4.1.0-alpha.0", features = ["agave-unstable-api"] }
+solana-program-option = "3.1.0"
+solana-program-pack = "3.1.0"
 solana-pubkey = { version = "4.2.0", default-features = false }
 solana-quic-client = { path = "../quic-client", version = "=4.1.0-alpha.0", features = ["agave-unstable-api"] }
 solana-rent = "4.1.0"
@@ -169,6 +172,8 @@ solana-unified-scheduler-pool = { path = "../unified-scheduler-pool", version = 
 solana-version = { path = "../version", version = "=4.1.0-alpha.0", features = ["agave-unstable-api"] }
 solana-vote = { path = "../vote", version = "=4.1.0-alpha.0", features = ["agave-unstable-api"] }
 solana-vote-program = { path = "../programs/vote", version = "=4.1.0-alpha.0", default-features = false, features = ["agave-unstable-api"] }
+spl-generic-token = "2.0.0"
+spl-token-interface = "2.0.0"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = "1.48.0"

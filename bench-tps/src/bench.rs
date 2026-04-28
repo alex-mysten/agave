@@ -6,6 +6,7 @@ use {
         },
         perf_utils::{SampleStats, sample_txs},
         send_batch::*,
+        token_setup::{TokenContext, read_token_amount},
     },
     chrono::Utc,
     log::*,
@@ -33,7 +34,7 @@ use {
     solana_transaction::{Transaction, versioned::VersionedTransaction},
     spl_instruction_padding_interface::instruction::wrap_instruction,
     std::{
-        collections::{HashSet, VecDeque},
+        collections::{HashMap, HashSet, VecDeque},
         process::exit,
         sync::{
             Arc, RwLock,
@@ -43,6 +44,11 @@ use {
         time::{Duration, Instant},
     },
 };
+
+/// CU limit set on every token tx; SPL Token Transfer real cost is ~4500 CU,
+/// 6_000 leaves headroom and keeps the per-tx writable-account cost bounded
+/// (matching `packed-ledger`'s token mode).
+const TOKEN_TX_COMPUTE_UNIT_LIMIT: u32 = 6_000;
 
 // The point at which transactions become "too old", in seconds.
 const MAX_TX_QUEUE_AGE: u64 = (MAX_PROCESSING_AGE as f64 * DEFAULT_S_PER_SLOT) as u64;
@@ -180,12 +186,20 @@ struct TransactionChunkGenerator<'a, 'b, T: ?Sized> {
     /// When true, never swap source/dest in `advance()`, so the destination
     /// keypair stays fixed for the entire run.
     single_destination: bool,
+    /// Token-mode context. When `Some`, every tx is an SPL Token Transfer of
+    /// 1 unit from the sender's pre-funded token account to a single fixed
+    /// dest token account. Implies `single_destination=true`.
+    token_context: Option<Arc<TokenContext>>,
+    /// When `token_context` is set, maps each sender keypair's pubkey to its
+    /// pre-funded SPL token account pubkey for use as the Transfer source.
+    sender_to_token_account: HashMap<Pubkey, Pubkey>,
 }
 
 impl<'a, 'b, T> TransactionChunkGenerator<'a, 'b, T>
 where
     T: 'static + TpsClient + Send + Sync + ?Sized,
 {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         client: Arc<T>,
         gen_keypairs: &'a [Keypair],
@@ -197,6 +211,7 @@ where
         single_destination: bool,
         skip_tx_account_data_size: bool,
         use_txv1: bool,
+        token_context: Option<Arc<TokenContext>>,
     ) -> Self {
         let account_chunks = if single_destination {
             KeypairChunks::new_with_single_destination(gen_keypairs, chunk_size)
@@ -207,6 +222,26 @@ where
         };
         let nonce_chunks =
             nonce_keypairs.map(|nonce_keypairs| KeypairChunks::new(nonce_keypairs, chunk_size));
+
+        let sender_to_token_account = token_context
+            .as_ref()
+            .map(|ctx| {
+                assert!(
+                    single_destination,
+                    "token_context requires single_destination"
+                );
+                assert_eq!(
+                    gen_keypairs.len(),
+                    ctx.per_keypair_token_accounts.len(),
+                    "token_context.per_keypair_token_accounts must align 1:1 with gen_keypairs"
+                );
+                gen_keypairs
+                    .iter()
+                    .zip(ctx.per_keypair_token_accounts.iter())
+                    .map(|(sender, tok)| (sender.pubkey(), tok.pubkey()))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
 
         TransactionChunkGenerator {
             client,
@@ -219,6 +254,8 @@ where
             skip_tx_account_data_size,
             use_txv1,
             single_destination,
+            token_context,
+            sender_to_token_account,
         }
     }
 
@@ -234,7 +271,35 @@ where
 
         let source_chunk = &self.account_chunks.source[self.chunk_index];
         let dest_chunk = &self.account_chunks.dest[self.chunk_index];
-        let transactions = if let Some(nonce_chunks) = &self.nonce_chunks {
+        let transactions = if let Some(token_ctx) = &self.token_context {
+            // Token mode: dest is the fixed dest_token_account; reclaim flag is
+            // ignored (every tx flows source_token_account -> dest_token_account).
+            let dest_token = token_ctx.dest_token_account().pubkey();
+            let mint = token_ctx.mint;
+            let token_program = token_ctx.token_program;
+            if let Some(nonce_chunks) = &self.nonce_chunks {
+                let source_nonce_chunk = &nonce_chunks.source[self.chunk_index];
+                generate_nonced_token_txs(
+                    self.client.clone(),
+                    source_chunk,
+                    source_nonce_chunk,
+                    &self.sender_to_token_account,
+                    &dest_token,
+                    &mint,
+                    &token_program,
+                )
+            } else {
+                assert!(blockhash.is_some());
+                generate_token_txs(
+                    source_chunk,
+                    &self.sender_to_token_account,
+                    &dest_token,
+                    &mint,
+                    &token_program,
+                    blockhash.unwrap(),
+                )
+            }
+        } else if let Some(nonce_chunks) = &self.nonce_chunks {
             let source_nonce_chunk = &nonce_chunks.source[self.chunk_index];
             let dest_nonce_chunk: &VecDeque<&Keypair> = &nonce_chunks.dest[self.chunk_index];
             generate_nonced_system_txs(
@@ -440,6 +505,7 @@ pub fn do_bench_tps<T>(
     config: Config,
     gen_keypairs: Vec<Keypair>,
     nonce_keypairs: Option<Vec<Keypair>>,
+    token_context: Option<Arc<TokenContext>>,
 ) -> u64
 where
     T: 'static + TpsClient + Send + Sync + ?Sized,
@@ -474,6 +540,16 @@ where
         );
         bal
     });
+    let dest_token_starting_amount = token_context.as_ref().map(|ctx| {
+        let amt = read_token_amount(client.as_ref(), &ctx.dest_token_account().pubkey());
+        info!(
+            "Token mode: dest_token_account={}, starting amount={} (mint={})",
+            ctx.dest_token_account().pubkey(),
+            amt,
+            ctx.mint,
+        );
+        amt
+    });
     let chunk_generator = TransactionChunkGenerator::new(
         client.clone(),
         &gen_keypairs,
@@ -485,6 +561,7 @@ where
         single_destination,
         skip_tx_account_data_size,
         use_txv1,
+        token_context.clone(),
     );
 
     let first_tx_count = loop {
@@ -595,14 +672,29 @@ where
     let bench_elapsed = start.elapsed();
 
     if let (Some(pubkey), Some(starting)) = (single_dest_pubkey, single_dest_starting_balance) {
-        let ending = client.get_balance(&pubkey).unwrap_or(0);
+        if token_context.is_none() {
+            let ending = client.get_balance(&pubkey).unwrap_or(0);
+            let deposits = ending.saturating_sub(starting);
+            info!(
+                "Single-destination deposit summary: {pubkey} balance {starting} -> {ending} \
+                 (delta {deposits} lamports = {deposits} successful 1-lamport deposits over \
+                 {:.2}s = {:.2} successful deposits/sec)",
+                bench_elapsed.as_secs_f64(),
+                deposits as f64 / bench_elapsed.as_secs_f64().max(f64::EPSILON),
+            );
+        }
+    }
+    if let (Some(ctx), Some(starting)) = (token_context.as_ref(), dest_token_starting_amount) {
+        let dest_pubkey = ctx.dest_token_account().pubkey();
+        let ending = read_token_amount(client.as_ref(), &dest_pubkey);
         let deposits = ending.saturating_sub(starting);
         info!(
-            "Single-destination deposit summary: {pubkey} balance {starting} -> {ending} \
-             (delta {deposits} lamports = {deposits} successful 1-lamport deposits over \
-             {:.2}s = {:.2} successful deposits/sec)",
+            "Single-destination token deposit summary: {dest_pubkey} amount {starting} -> {ending} \
+             (delta {deposits} units = {deposits} successful 1-unit token transfers over \
+             {:.2}s = {:.2} successful deposits/sec; mint={})",
             bench_elapsed.as_secs_f64(),
             deposits as f64 / bench_elapsed.as_secs_f64().max(f64::EPSILON),
+            ctx.mint,
         );
     }
 
@@ -992,6 +1084,101 @@ fn generate_nonced_system_txs<T: 'static + TpsClient + Send + Sync + ?Sized>(
         }
     }
     transactions
+}
+
+fn build_token_transfer_ix(
+    token_program: &Pubkey,
+    source_token_acc: &Pubkey,
+    dest_token_acc: &Pubkey,
+    authority: &Pubkey,
+) -> Instruction {
+    spl_token_interface::instruction::transfer(
+        token_program,
+        source_token_acc,
+        dest_token_acc,
+        authority,
+        &[],
+        1,
+    )
+    .expect("build spl token Transfer ix")
+}
+
+fn generate_token_txs(
+    source: &[&Keypair],
+    sender_to_token_account: &HashMap<Pubkey, Pubkey>,
+    dest_token_account: &Pubkey,
+    _mint: &Pubkey,
+    token_program: &Pubkey,
+    blockhash: &Hash,
+) -> Vec<TimestampedTransaction> {
+    source
+        .par_iter()
+        .map(|sender| {
+            let source_token_acc = sender_to_token_account
+                .get(&sender.pubkey())
+                .copied()
+                .expect("sender keypair has no token account in token_context");
+            let cu_limit_ix =
+                ComputeBudgetInstruction::set_compute_unit_limit(TOKEN_TX_COMPUTE_UNIT_LIMIT);
+            let transfer_ix = build_token_transfer_ix(
+                token_program,
+                &source_token_acc,
+                dest_token_account,
+                &sender.pubkey(),
+            );
+            let msg = Message::new(&[cu_limit_ix, transfer_ix], Some(&sender.pubkey()));
+            let tx = Transaction::new(&[*sender], msg, *blockhash);
+            TimestampedTransaction {
+                transaction: tx.into(),
+                timestamp: None,
+                compute_unit_price: None,
+            }
+        })
+        .collect()
+}
+
+fn generate_nonced_token_txs<T: 'static + TpsClient + Send + Sync + ?Sized>(
+    client: Arc<T>,
+    source: &[&Keypair],
+    source_nonce: &[&Keypair],
+    sender_to_token_account: &HashMap<Pubkey, Pubkey>,
+    dest_token_account: &Pubkey,
+    _mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Vec<TimestampedTransaction> {
+    let pubkeys: Vec<Pubkey> = source_nonce.iter().map(|kp| kp.pubkey()).collect();
+    let nonce_blockhashes: Vec<Hash> = get_nonce_blockhashes(&client, &pubkeys);
+
+    source
+        .iter()
+        .enumerate()
+        .map(|(i, sender)| {
+            let source_token_acc = sender_to_token_account
+                .get(&sender.pubkey())
+                .copied()
+                .expect("sender keypair has no token account in token_context");
+            let cu_limit_ix =
+                ComputeBudgetInstruction::set_compute_unit_limit(TOKEN_TX_COMPUTE_UNIT_LIMIT);
+            let transfer_ix = build_token_transfer_ix(
+                token_program,
+                &source_token_acc,
+                dest_token_account,
+                &sender.pubkey(),
+            );
+            let msg = Message::new_with_nonce(
+                vec![cu_limit_ix, transfer_ix],
+                Some(&sender.pubkey()),
+                &source_nonce[i].pubkey(),
+                &sender.pubkey(),
+            );
+            let tx = Transaction::new(&[*sender], msg, nonce_blockhashes[i]);
+            TimestampedTransaction {
+                transaction: tx.into(),
+                timestamp: None,
+                compute_unit_price: None,
+            }
+        })
+        .collect()
 }
 
 fn generate_txs<T: 'static + TpsClient + Send + Sync + ?Sized>(
@@ -1411,7 +1598,7 @@ mod tests {
             None
         };
 
-        do_bench_tps(client, config, keypairs, nonce_keypairs);
+        do_bench_tps(client, config, keypairs, nonce_keypairs, None);
     }
 
     #[test]

@@ -11,6 +11,17 @@
 //!   3. SystemProgram::Transfer
 //! This is heavier per-tx and closer to what a mainnet-shaped deposit workload
 //! would see.
+//!
+//! Pass `--use-token` to switch from native SOL transfers to single-destination
+//! SPL Token transfers (simulates stablecoin transfer performance). Genesis
+//! pre-creates a mint, one initialized token account per sender (funded with
+//! per-tx supply), and one dest token account; each tx is then a 2-instruction
+//! transaction:
+//!   1. ComputeBudget::SetComputeUnitLimit (so per-tx CU doesn't default to 200k
+//!      and starve the writable-account-units budget)
+//!   2. spl_token::Transfer (1 unit, source -> dest, sender as authority)
+//! Combinable with `--use-nonce` to get the bench-tps-shape 3-instruction
+//! token tx (CB + AdvanceNonce + TokenTransfer).
 
 use {
     clap::{App, Arg},
@@ -20,6 +31,7 @@ use {
     solana_entry::entry::{next_entry_mut, Entry},
     solana_fee_calculator::FeeCalculator,
     solana_hash::Hash,
+    solana_instruction::Instruction,
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore::{create_new_ledger, Blockstore},
@@ -31,17 +43,40 @@ use {
         state::{Data as NonceData, DurableNonce, State as NonceState},
         versions::Versions as NonceVersions,
     },
+    solana_program_pack::Pack,
+    solana_pubkey::Pubkey,
     solana_runtime::genesis_utils::{create_genesis_config_with_leader, GenesisConfigInfo},
     solana_shred_version::version_from_hash,
     solana_signer::Signer,
     solana_system_interface::{instruction as system_instruction, program as system_program},
     solana_system_transaction as system_transaction,
     solana_transaction::Transaction,
+    spl_generic_token::token as spl_token_program,
+    spl_token_interface::state::{Account as TokenAccount, AccountState, Mint},
     std::{path::PathBuf, sync::Arc, time::Instant},
 };
 
 const NONCE_ACCOUNT_SIZE: usize = 80;
 const NONCE_RENT_EXEMPT_LAMPORTS: u64 = 2_000_000; // comfortably above 80-byte rent-exempt min
+
+// SPL Token Transfer real CU ~4500. Set the limit a bit above to leave headroom
+// for sig + write-locks accounting in the per-tx programs_execution_cost field
+// (which the cost model uses to enforce writable-account-units / block-units).
+// Setting this explicitly is essential — without it the default per-ix
+// 200_000-CU budget would let only ~120 single-dest token transfers fit under
+// the per-block writable-account budget (24M).
+const TOKEN_TX_COMPUTE_UNIT_LIMIT: u32 = 6_000;
+// 6-decimal mint, e.g. USDC-shape. Funded supply per sender comfortably
+// exceeds num_slots * 1-unit/slot.
+const TOKEN_DECIMALS: u8 = 6;
+const PER_SENDER_TOKEN_SUPPLY: u64 = 1_000_000;
+// Dev cluster genesis is created with `Rent::default()` which sets
+// `lamports_per_byte_year=0`, so `minimum_balance(82)` returns 0. Zero-lamport
+// accounts are skipped by `is_loadable()` (and runtime filters them in many
+// places), so we explicitly fund mint + token accounts with a small fixed
+// balance to keep them visible/loadable. 2_000_000 lamports is the same
+// conservative floor we use for nonce accounts above.
+const TOKEN_ACCOUNT_LAMPORTS_FLOOR: u64 = 2_000_000;
 
 fn main() {
     agave_logger::setup_with_default("info");
@@ -78,23 +113,39 @@ fn main() {
                      nonce accounts in genesis.",
                 ),
         )
+        .arg(
+            Arg::with_name("use_token")
+                .long("use-token")
+                .takes_value(false)
+                .help(
+                    "Generate SPL Token (Tokenkeg... program) Transfer txs \
+                     instead of native SOL transfers. Stablecoin-shape workload: \
+                     hot writable account is the dest token account, not the \
+                     dest system account. Adds a ComputeBudget::SetComputeUnitLimit \
+                     instruction so per-tx CU doesn't default to 200k. \
+                     Stackable with --use-nonce.",
+                ),
+        )
         .get_matches();
 
     let ledger_path: PathBuf = matches.value_of("ledger").unwrap().into();
     let txs_per_slot: usize = matches.value_of("txs_per_slot").unwrap().parse().unwrap();
     let num_slots: u64 = matches.value_of("num_slots").unwrap().parse().unwrap();
     let use_nonce = matches.is_present("use_nonce");
+    let use_token = matches.is_present("use_token");
 
+    let tx_shape = match (use_token, use_nonce) {
+        (false, false) => "1-instruction (SOL Transfer only)",
+        (false, true) => "3-instruction (ComputeBudget + AdvanceNonce + SOL Transfer)",
+        (true, false) => "2-instruction (ComputeBudget + Token Transfer)",
+        (true, true) => "4-instruction (ComputeBudget + AdvanceNonce + ComputeBudgetLimit + Token Transfer)",
+    };
     println!(
         "Building packed ledger at {} — {} txs × {} slot(s), tx shape: {}",
         ledger_path.display(),
         txs_per_slot,
         num_slots,
-        if use_nonce {
-            "3-instruction (ComputeBudget + AdvanceNonce + Transfer)"
-        } else {
-            "1-instruction (Transfer only)"
-        }
+        tx_shape,
     );
 
     if use_nonce && num_slots > 1 {
@@ -107,7 +158,8 @@ fn main() {
     }
 
     // Generate sender keypairs, destination, and (if nonce mode) one nonce
-    // keypair per sender.
+    // keypair per sender. In token mode also: one mint keypair, one token-account
+    // keypair per sender, and one dest token-account keypair.
     let t = Instant::now();
     let senders: Vec<Keypair> = (0..txs_per_slot)
         .into_par_iter()
@@ -122,12 +174,33 @@ fn main() {
     } else {
         Vec::new()
     };
+    let (mint_kp, sender_token_kps, dest_token_kp) = if use_token {
+        let mint_kp = Keypair::new();
+        let sender_token_kps: Vec<Keypair> = (0..txs_per_slot)
+            .into_par_iter()
+            .map(|_| Keypair::new())
+            .collect();
+        let dest_token_kp = Keypair::new();
+        (Some(mint_kp), sender_token_kps, Some(dest_token_kp))
+    } else {
+        (None, Vec::new(), None)
+    };
     println!(
-        "  generated {} senders + 1 destination ({}){} in {:?}",
+        "  generated {} senders + 1 destination ({}){}{} in {:?}",
         senders.len(),
         dest.pubkey(),
         if use_nonce {
             format!(" + {} nonce keypairs", nonce_keypairs.len())
+        } else {
+            String::new()
+        },
+        if use_token {
+            format!(
+                " + mint {} + {} sender token accounts + dest token account {}",
+                mint_kp.as_ref().unwrap().pubkey(),
+                sender_token_kps.len(),
+                dest_token_kp.as_ref().unwrap().pubkey(),
+            )
         } else {
             String::new()
         },
@@ -205,6 +278,129 @@ fn main() {
             );
         }
     }
+
+    if use_token {
+        // Inject the SPL Token program (and friends) into genesis. The default
+        // create_genesis_config_with_leader_ex pulls in the native SOL mint
+        // account but not the Tokenkeg... program ELF, so without this our
+        // token transfer txs would fail at execution time even though the
+        // token state accounts deserialize fine.
+        //
+        // create_genesis_config_with_leader uses `Rent::free()` (zero rate),
+        // which makes `bpf_loader_upgradeable_program_accounts` produce
+        // program accounts with lamports=0. Zero-lamport accounts are not
+        // loadable, so the bank's tx executor sees `ProgramAccountNotFound`
+        // and every token transfer fails (committed-but-failed). Pass a
+        // realistic Rent to compute proper rent-exempt minimums for the
+        // program/programdata accounts.
+        let program_rent = solana_rent::Rent::default();
+        for (program_id, account) in solana_program_binaries::spl_programs(&program_rent) {
+            genesis_config
+                .accounts
+                .insert(program_id, Account::from(account));
+        }
+        let mint_kp = mint_kp.as_ref().unwrap();
+        let dest_token_kp = dest_token_kp.as_ref().unwrap();
+        let token_program_id = spl_token_program::id();
+        let mint_rent = genesis_config
+            .rent
+            .minimum_balance(Mint::LEN)
+            .max(TOKEN_ACCOUNT_LAMPORTS_FLOOR);
+        let token_acc_rent = genesis_config
+            .rent
+            .minimum_balance(TokenAccount::LEN)
+            .max(TOKEN_ACCOUNT_LAMPORTS_FLOOR);
+
+        // Mint: pre-initialized, supply = total funded across all sender accounts,
+        // no freeze authority, mint authority set to a throwaway pubkey since we
+        // never mint at runtime in this generator.
+        let total_supply: u64 = PER_SENDER_TOKEN_SUPPLY
+            .checked_mul(txs_per_slot as u64)
+            .expect("mint supply overflow");
+        let mint_state = Mint {
+            mint_authority: solana_program_option::COption::Some(Pubkey::new_unique()),
+            supply: total_supply,
+            decimals: TOKEN_DECIMALS,
+            is_initialized: true,
+            freeze_authority: solana_program_option::COption::None,
+        };
+        let mut mint_data = vec![0u8; Mint::LEN];
+        mint_state.pack_into_slice(&mut mint_data);
+        genesis_config.accounts.insert(
+            mint_kp.pubkey(),
+            Account {
+                lamports: mint_rent,
+                data: mint_data,
+                owner: token_program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+
+        // Each sender's token account: owned (in SPL sense) by the sender keypair,
+        // funded with PER_SENDER_TOKEN_SUPPLY units. Account.owner (Solana account
+        // owner) is the token program; SPL Account.owner is the sender keypair.
+        let mint_pubkey = mint_kp.pubkey();
+        let sender_token_accounts: Vec<(Pubkey, Account)> = senders
+            .par_iter()
+            .zip(sender_token_kps.par_iter())
+            .map(|(sender, tok_kp)| {
+                let state = TokenAccount {
+                    mint: mint_pubkey,
+                    owner: sender.pubkey(),
+                    amount: PER_SENDER_TOKEN_SUPPLY,
+                    delegate: solana_program_option::COption::None,
+                    state: AccountState::Initialized,
+                    is_native: solana_program_option::COption::None,
+                    delegated_amount: 0,
+                    close_authority: solana_program_option::COption::None,
+                };
+                let mut data = vec![0u8; TokenAccount::LEN];
+                state.pack_into_slice(&mut data);
+                (
+                    tok_kp.pubkey(),
+                    Account {
+                        lamports: token_acc_rent,
+                        data,
+                        owner: token_program_id,
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+            })
+            .collect();
+        for (key, acc) in sender_token_accounts {
+            genesis_config.accounts.insert(key, acc);
+        }
+
+        // Dest token account: owned by `dest`, balance 0.
+        let dest_state = TokenAccount {
+            mint: mint_pubkey,
+            owner: dest.pubkey(),
+            amount: 0,
+            delegate: solana_program_option::COption::None,
+            state: AccountState::Initialized,
+            is_native: solana_program_option::COption::None,
+            delegated_amount: 0,
+            close_authority: solana_program_option::COption::None,
+        };
+        let mut dest_data = vec![0u8; TokenAccount::LEN];
+        dest_state.pack_into_slice(&mut dest_data);
+        genesis_config.accounts.insert(
+            dest_token_kp.pubkey(),
+            Account {
+                lamports: token_acc_rent,
+                data: dest_data,
+                owner: token_program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        println!(
+            "  token mode: mint={}, supply={}, decimals={}, dest_token_account={}",
+            mint_pubkey, total_supply, TOKEN_DECIMALS, dest_token_kp.pubkey(),
+        );
+    }
     println!(
         "  populated genesis with {} primordial accounts in {:?}",
         genesis_config.accounts.len(),
@@ -254,19 +450,50 @@ fn main() {
         let t_slot = Instant::now();
 
         let t = Instant::now();
-        let txs: Vec<Transaction> = if use_nonce {
-            senders
-                .par_iter()
-                .zip(nonce_keypairs.par_iter())
-                .map(|(sender, nonce_kp)| build_nonced_tx(sender, nonce_kp, &dest.pubkey(), tx_blockhash))
-                .collect()
-        } else {
-            senders
+        let txs: Vec<Transaction> = match (use_token, use_nonce) {
+            (false, false) => senders
                 .par_iter()
                 .map(|sender| {
                     system_transaction::transfer(sender, &dest.pubkey(), 1, tx_blockhash)
                 })
-                .collect()
+                .collect(),
+            (false, true) => senders
+                .par_iter()
+                .zip(nonce_keypairs.par_iter())
+                .map(|(sender, nonce_kp)| build_nonced_tx(sender, nonce_kp, &dest.pubkey(), tx_blockhash))
+                .collect(),
+            (true, false) => {
+                let dest_token = dest_token_kp.as_ref().unwrap().pubkey();
+                senders
+                    .par_iter()
+                    .zip(sender_token_kps.par_iter())
+                    .map(|(sender, sender_tok_kp)| {
+                        build_token_transfer_tx(
+                            sender,
+                            &sender_tok_kp.pubkey(),
+                            &dest_token,
+                            tx_blockhash,
+                        )
+                    })
+                    .collect()
+            }
+            (true, true) => {
+                let dest_token = dest_token_kp.as_ref().unwrap().pubkey();
+                senders
+                    .par_iter()
+                    .zip(sender_token_kps.par_iter())
+                    .zip(nonce_keypairs.par_iter())
+                    .map(|((sender, sender_tok_kp), nonce_kp)| {
+                        build_nonced_token_transfer_tx(
+                            sender,
+                            &sender_tok_kp.pubkey(),
+                            &dest_token,
+                            nonce_kp,
+                            tx_blockhash,
+                        )
+                    })
+                    .collect()
+            }
         };
         let build_us = t.elapsed().as_micros();
 
@@ -346,7 +573,7 @@ fn main() {
 fn build_nonced_tx(
     sender: &Keypair,
     nonce_kp: &Keypair,
-    dest: &solana_pubkey::Pubkey,
+    dest: &Pubkey,
     nonce_hash: Hash,
 ) -> Transaction {
     // Instructions in the order `Message::new_with_nonce` expects:
@@ -359,6 +586,49 @@ fn build_nonced_tx(
         Some(&sender.pubkey()),
         &nonce_kp.pubkey(),
         &sender.pubkey(), // sender IS the nonce authority
+    );
+    Transaction::new(&[sender], msg, nonce_hash)
+}
+
+fn token_transfer_ix(source: &Pubkey, dest: &Pubkey, authority: &Pubkey) -> Instruction {
+    spl_token_interface::instruction::transfer(
+        &spl_token_program::id(),
+        source,
+        dest,
+        authority,
+        &[],
+        1,
+    )
+    .expect("build spl token transfer")
+}
+
+fn build_token_transfer_tx(
+    sender: &Keypair,
+    sender_token_acc: &Pubkey,
+    dest_token_acc: &Pubkey,
+    blockhash: Hash,
+) -> Transaction {
+    let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(TOKEN_TX_COMPUTE_UNIT_LIMIT);
+    let transfer_ix = token_transfer_ix(sender_token_acc, dest_token_acc, &sender.pubkey());
+    let msg = Message::new(&[cu_limit_ix, transfer_ix], Some(&sender.pubkey()));
+    Transaction::new(&[sender], msg, blockhash)
+}
+
+fn build_nonced_token_transfer_tx(
+    sender: &Keypair,
+    sender_token_acc: &Pubkey,
+    dest_token_acc: &Pubkey,
+    nonce_kp: &Keypair,
+    nonce_hash: Hash,
+) -> Transaction {
+    let cu_price_ix = ComputeBudgetInstruction::set_compute_unit_price(1);
+    let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(TOKEN_TX_COMPUTE_UNIT_LIMIT);
+    let transfer_ix = token_transfer_ix(sender_token_acc, dest_token_acc, &sender.pubkey());
+    let msg = Message::new_with_nonce(
+        vec![cu_price_ix, cu_limit_ix, transfer_ix],
+        Some(&sender.pubkey()),
+        &nonce_kp.pubkey(),
+        &sender.pubkey(),
     );
     Transaction::new(&[sender], msg, nonce_hash)
 }

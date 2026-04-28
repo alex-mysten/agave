@@ -52,6 +52,7 @@ solana-metrics = { workspace = true }
 solana-native-token = { workspace = true }
 solana-net-utils = { workspace = true }
 solana-nonce = { workspace = true }
+solana-program-pack = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-quic-client = { workspace = true }
 solana-rpc = { workspace = true }
@@ -68,7 +69,9 @@ solana-tpu-client = { workspace = true }
 solana-transaction = { workspace = true }
 solana-transaction-status = { workspace = true }
 solana-version = { workspace = true }
+spl-generic-token = { workspace = true }
 spl-instruction-padding-interface = { version = "=1.0.0" }
+spl-token-interface = { workspace = true }
 
 [target.'cfg(not(any(target_env = "msvc", target_os = "freebsd")))'.dependencies]
 jemallocator = { workspace = true }
